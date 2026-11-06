@@ -65,6 +65,8 @@ def test_public_surface_matches_the_sketch():
         "read_side",
         "run_verify",
         "read_verify",
+        "compile_survey_maps",
+        "verify_survey_maps",
     )
 
 

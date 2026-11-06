@@ -53,6 +53,8 @@ __all__ = (
     "read_side",
     "run_verify",
     "read_verify",
+    "compile_survey_maps",
+    "verify_survey_maps",
 )
 
 
@@ -96,6 +98,15 @@ class SideCheck(TypedDict):
     runtime: Literal["openvino"]
     matches_fit: bool | None
     agents: list[AgentColumns]
+
+
+class SurveyMapBoard(TypedDict):
+    status: Literal["COMPILED"]
+    device: Literal["NPU"]
+    runtime: Literal["openvino"]
+    algorithms: list[AlgorithmColumn]
+    agents: list[AgentColumns]
+    n_rows: int
 
 
 class InferenceRefused(RuntimeError):
@@ -621,6 +632,97 @@ def run_verify(store, protocol, experiment_id: str) -> SideCheck:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, check)
     return check
+
+
+def compile_survey_maps(surveys: list, policy: dict, dest: Path) -> SurveyMapBoard:
+    """Fit every map from _maps on these survey rows and compile each IR on the NPU.
+
+    The study seed is not a fit parameter. mlp uses fit_map with SEED and EPOCHS.
+    n_rows is the number of pre/post pairs. status stays COMPILED so a calibration
+    reader that requires INFERRED does not accept this file. Writes only under dest.
+    """
+    rows = _agent_rows(surveys, policy)
+    if len(rows) < 2:
+        raise ValueError("问卷不足以配成两对前后测")
+    specs = _maps()
+    prepared = [(spec, convert_ir(spec.fit(rows))) for spec in specs]
+    compiled_in_order = []
+    irs = []
+    for spec, ir in prepared:
+        compiled_in_order.append((spec.id, compile_deployed(ir)))
+        irs.append((spec.id, ir))
+    ids = tuple(spec.id for spec, _ir in prepared)
+    reports = {algorithm_id: _discrepancy(compiled, rows) for algorithm_id, compiled in compiled_in_order}
+    board = {
+        "status": "COMPILED",
+        "device": "NPU",
+        "runtime": "openvino",
+        "algorithms": [{"id": spec.id, "fit": spec.note()} for spec, _ir in prepared],
+        "agents": _agent_columns(ids, reports),
+        "n_rows": len(rows),
+    }
+    _publish(dest, ids, irs, board)
+    return board
+
+
+def verify_survey_maps(surveys: list, policy: dict, side_dir: Path) -> SideCheck:
+    """Compile the saved IR on the NPU and score these survey rows.
+
+    matches_fit compares the new scores with the saved board. This pass scores
+    the rows the board was fitted on, so matches_fit is a bool. experiment_id
+    is the research id stored beside this side directory.
+    """
+    package_path = side_dir.parent / "package.json"
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("复现包无法读取") from error
+    if not isinstance(package, dict) or not isinstance(package.get("research_id"), str):
+        raise ValueError("复现包无法读取")
+    experiment_id = package["research_id"]
+    board_path = side_dir / "board.json"
+    if not board_path.is_file():
+        raise ValueError("尚未在 NPU 上编译")
+    try:
+        board = json.loads(board_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("侧端记录无法读取") from error
+    if (
+        not isinstance(board, dict)
+        or board.get("status") != "COMPILED"
+        or board.get("device") != "NPU"
+        or board.get("runtime") != "openvino"
+    ):
+        raise ValueError("侧端记录无法读取")
+    algorithms = board.get("algorithms")
+    saved = board.get("agents")
+    if not isinstance(algorithms, list) or not algorithms or not isinstance(saved, list):
+        raise ValueError("侧端记录无法读取")
+    ids = []
+    for column in algorithms:
+        if not isinstance(column, dict) or not isinstance(column.get("id"), str) or column["id"] in ids:
+            raise ValueError("侧端记录无法读取")
+        ids.append(column["id"])
+    compiled_in_order = []
+    for algorithm_id in ids:
+        xml = side_dir / algorithm_id / "model.xml"
+        if not xml.is_file():
+            raise ValueError("侧端模型不完整")
+        compiled_in_order.append((algorithm_id, compile_deployed(_read_ir(xml))))
+    rows = _agent_rows(surveys, policy)
+    reports = {algorithm_id: _discrepancy(compiled, rows) for algorithm_id, compiled in compiled_in_order}
+    agents = _agent_columns(tuple(ids), reports)
+    try:
+        matches_fit = _same_agents(agents, saved)
+    except (KeyError, TypeError) as error:
+        raise ValueError("侧端记录无法读取") from error
+    return {
+        "experiment_id": str(experiment_id),
+        "device": "NPU",
+        "runtime": "openvino",
+        "matches_fit": matches_fit,
+        "agents": agents,
+    }
 
 
 def read_verify(store, protocol_id: str, experiment_id: str) -> SideCheck | None:

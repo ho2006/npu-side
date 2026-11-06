@@ -583,6 +583,113 @@ export function readCheckView(value: unknown): CheckView | null {
   };
 }
 
+export type ReproductionCard = {
+  research_id: string;
+  status: "COMPLETED";
+  title: string;
+  choice: {
+    mode: "live";
+    design: "clarity";
+    exposure: "social";
+    policy_id: "cn-digital-2026-v1";
+    activation_rate: 0.5;
+    temperature: 0.7;
+    agent_count: number;
+    rounds: number;
+    seeds: number[];
+  };
+  occupancy: {
+    device: "NPU";
+    full_name: string;
+    peak_percent: number;
+    engine: string;
+    burst_inferences: number;
+  } | null;
+  compiled: boolean;
+  matches_fit: boolean | null;
+};
+
+export function readReproductionCard(value: unknown): ReproductionCard | null {
+  if (!isRecord(value) || value.status !== "COMPLETED") return null;
+  if (typeof value.research_id !== "string" || value.research_id === "") return null;
+  if (typeof value.title !== "string" || value.title === "") return null;
+  if (typeof value.compiled !== "boolean") return null;
+  if (value.matches_fit !== null && typeof value.matches_fit !== "boolean") return null;
+  const choice = readReproductionChoice(value.choice);
+  if (!choice) return null;
+  const occupancy = readOccupancy(value.occupancy);
+  if (occupancy === undefined) return null;
+  return {
+    research_id: value.research_id,
+    status: "COMPLETED",
+    title: value.title,
+    choice,
+    occupancy,
+    compiled: value.compiled,
+    matches_fit: value.matches_fit,
+  };
+}
+
+export function readReproductionList(value: unknown): ReproductionCard[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: ReproductionCard[] = [];
+  for (const item of value) {
+    const card = readReproductionCard(item);
+    if (!card) return null;
+    rows.push(card);
+  }
+  return rows;
+}
+
+export function readReproductionDetail(
+  value: unknown,
+): { card: ReproductionCard; metrics: unknown; population: unknown; events: unknown } | null {
+  if (!isRecord(value)) return null;
+  const card = readReproductionCard(value.card);
+  if (!card || !isRecord(value.population) || !isRecord(value.events)) return null;
+  return { card, metrics: value.metrics, population: value.population, events: value.events };
+}
+
+function readReproductionChoice(value: unknown): ReproductionCard["choice"] | null {
+  if (!isRecord(value)) return null;
+  if (value.mode !== "live" || value.design !== "clarity" || value.exposure !== "social") return null;
+  if (value.policy_id !== "cn-digital-2026-v1" || value.activation_rate !== 0.5 || value.temperature !== 0.7) return null;
+  if (typeof value.agent_count !== "number" || !Number.isInteger(value.agent_count)) return null;
+  if (typeof value.rounds !== "number" || !Number.isInteger(value.rounds)) return null;
+  if (!Array.isArray(value.seeds)) return null;
+  const seeds: number[] = [];
+  for (const seed of value.seeds) {
+    if (typeof seed !== "number" || !Number.isInteger(seed)) return null;
+    seeds.push(seed);
+  }
+  return {
+    mode: "live",
+    design: "clarity",
+    exposure: "social",
+    policy_id: "cn-digital-2026-v1",
+    activation_rate: 0.5,
+    temperature: 0.7,
+    agent_count: value.agent_count,
+    rounds: value.rounds,
+    seeds,
+  };
+}
+
+function readOccupancy(value: unknown): ReproductionCard["occupancy"] | undefined {
+  if (value === null) return null;
+  if (!isRecord(value) || value.device !== "NPU") return undefined;
+  if (typeof value.full_name !== "string" || typeof value.engine !== "string") return undefined;
+  if (typeof value.peak_percent !== "number" || !Number.isFinite(value.peak_percent)) return undefined;
+  if (typeof value.burst_inferences !== "number" || !Number.isInteger(value.burst_inferences)) return undefined;
+  return {
+    device: "NPU",
+    full_name: value.full_name,
+    peak_percent: value.peak_percent,
+    engine: value.engine,
+    burst_inferences: value.burst_inferences,
+  };
+}
+
 function agentColumns(ids: string[]): TableModel["columns"] {
   return [
     { key: "condition", header: "condition" },

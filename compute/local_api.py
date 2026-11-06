@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
+import npu_side.reproductions as reproductions
 import npu_side.side_infer as side
 from npu_side.io import write_json
 from npu_side.policy import get_policy, material_manifest
@@ -465,6 +466,16 @@ class App(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             fail("请求不是 JSON")
 
+    def _is_zip(self):
+        content_type = self.headers.get("Content-Type", "")
+        return content_type.split(";", 1)[0].strip().lower() == "application/zip"
+
+    def _read_limited(self, cap):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > cap:
+            fail("文件超过 1MiB，未发送。")
+        return self.rfile.read(length) if length else b""
+
     def _parts(self):
         return [part for part in urlparse(self.path).path.split("/") if part]
 
@@ -480,8 +491,14 @@ class App(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            parts = self._parts()
+            if parts == ["reproductions"] and self._is_zip():
+                archive = self._read_limited(1_048_576)
+                with LOCK:
+                    self._send(200, reproductions.import_package(self.store.root, archive))
+                return
             with LOCK:
-                self._post(self._parts(), self._read_body())
+                self._post(parts, self._read_body())
         except ValueError as error:
             self._error(400, str(error))
         except side.InferenceRefused as error:
@@ -491,6 +508,16 @@ class App(BaseHTTPRequestHandler):
             self._error(500, str(error) or "请求失败")
 
     def _get(self, parts):
+        if parts == ["reproductions"]:
+            self._send(200, reproductions.list_packages(self.store.root))
+            return
+        if len(parts) == 2 and parts[0] == "reproductions":
+            detail = reproductions.package_detail(self.store.root, parts[1])
+            if detail is None:
+                self._error(404, "没有这个复现包")
+                return
+            self._send(200, detail)
+            return
         if parts == []:
             self._send(200, {"ok": True})
             return
@@ -550,6 +577,20 @@ class App(BaseHTTPRequestHandler):
         self._error(404, "没有这个接口")
 
     def _post(self, parts, body):
+        if len(parts) == 3 and parts[0] == "reproductions" and parts[2] == "launch":
+            result = reproductions.launch_maps(self.store.root, parts[1])
+            if result is None:
+                self._error(404, "没有这个复现包")
+                return
+            self._send(200, result)
+            return
+        if len(parts) == 3 and parts[0] == "reproductions" and parts[2] == "verify":
+            result = reproductions.verify_maps(self.store.root, parts[1])
+            if result is None:
+                self._error(404, "没有这个复现包")
+                return
+            self._send(200, result)
+            return
         if parts == ["research", "plan"]:
             question = require_text(body.get("question") if isinstance(body, dict) else None, "研究问题是空的")
             choice = require_choice(body)
