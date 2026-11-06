@@ -8,3 +8,5 @@ next-env.d.ts
 __pycache__/
 .pytest_cache/
 *.pyc
+compute/local_store/
+.audit/

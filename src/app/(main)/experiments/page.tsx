@@ -140,7 +140,7 @@ export default function ExperimentsPage() {
       <Card>
         <CardHeader>
           <CardTitle>研究计划</CardTitle>
-          <CardDescription>smoke 读取本地案例。live 把问题交给 Qwen。</CardDescription>
+          <CardDescription>smoke 读取本地案例。live 也在本机生成计划，不把问题发给 Qwen。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
           <div className="grid gap-2">
@@ -232,7 +232,7 @@ export default function ExperimentsPage() {
           </div>
           <p className="text-sm text-muted-foreground">direct 与 factorial 不能同时使用。</p>
           <Button disabled={busy} onClick={() => void loadPlan()}>
-            {choice.mode === "smoke" ? "加载案例研究计划" : "使用 Qwen 生成研究计划"}
+            {choice.mode === "smoke" ? "加载案例研究计划" : "生成本地研究计划"}
           </Button>
         </CardContent>
       </Card>
