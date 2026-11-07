@@ -3,6 +3,7 @@
 import io
 import json
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -19,6 +20,7 @@ from npu_side.policy import get_policy, material_manifest
 from npu_side.records import CalibrationData
 from npu_side.scoring import score_answer
 from npu_occupancy import sustain_npu
+from request_log import RequestRecord, Sent, elapsed_ms, write_request
 
 ROOT = Path(__file__).resolve().parent / "local_store"
 HOST = "127.0.0.1"
@@ -437,28 +439,92 @@ class App(BaseHTTPRequestHandler):
     store: Store
 
     def log_message(self, fmt, *args):
-        print(f"{self.command} {self.path} {fmt % args}", flush=True)
+        return
+
+    def send_error(self, code, message=None, explain=None):
+        status = int(code)
+        if message:
+            detail = message
+        else:
+            detail = self.responses.get(status, ("???",))[0]
+        if getattr(self, "_request", None) is None:
+            self._begin()
+        self._error(status, detail)
+
+    def _access(self):
+        return self.store.root / "access"
+
+    def _begin(self):
+        self._started_ns = time.monotonic_ns()
+        self._bytes_read = 0
+        self._sent = None
+        command = getattr(self, "command", None) or "UNKNOWN"
+        path = getattr(self, "path", None) or "/"
+        self._request = RequestRecord.started(command, path, 0)
+        write_request(self._access(), self._request)
+
+    def _open_record(self):
+        if self._request.bytes_in != self._bytes_read:
+            self._request = self._request.with_bytes_in(self._bytes_read)
+        return self._request
+
+    def _finish(self):
+        sent = self._sent
+        if sent is None:
+            return
+        detail = sent.detail
+        error_type = sent.error_type
+        if 200 <= sent.status < 300:
+            detail = None
+            error_type = None
+        elif not detail:
+            detail = self.responses.get(sent.status, ("请求失败",))[0]
+        write_request(
+            self._access(),
+            self._open_record().finished(
+                status=sent.status,
+                bytes_out=sent.bytes_out,
+                duration_ms=elapsed_ms(self._started_ns),
+                detail=detail,
+                error_type=error_type,
+            ),
+        )
 
     def _send(self, status, payload=None, body=None, content_type="application/json; charset=utf-8", disposition=None):
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
+        outgoing = body or b""
+        self._sent = Sent(int(status), len(outgoing), None, None)
+        self.send_response(int(status))
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body or b"")))
+        self.send_header("Content-Length", str(len(outgoing)))
         if disposition:
             self.send_header("Content-Disposition", disposition)
         self.end_headers()
-        if body:
-            self.wfile.write(body)
+        if outgoing:
+            self.wfile.write(outgoing)
 
-    def _error(self, status, message):
-        self._send(status, {"detail": message})
+    def _error(self, status, message, error_type=None):
+        detail = message if message else "请求失败"
+        status = int(status)
+        body = json.dumps({"detail": detail}, ensure_ascii=False).encode("utf-8")
+        self._send(status, body=body)
+        self._sent = Sent(status, len(body), detail, error_type)
+        closed = self._open_record().finished(
+            status=status,
+            bytes_out=len(body),
+            duration_ms=elapsed_ms(self._started_ns),
+            detail=detail,
+            error_type=error_type,
+        )
+        write_request(self._access(), closed)
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length > 1_048_576:
             fail("文件超过 1MiB，未发送。")
         raw = self.rfile.read(length) if length else b""
+        self._bytes_read = len(raw)
         if not raw:
             return {}
         try:
@@ -480,32 +546,47 @@ class App(BaseHTTPRequestHandler):
         return [part for part in urlparse(self.path).path.split("/") if part]
 
     def do_GET(self):
+        self._begin()
         try:
             with LOCK:
                 self._get(self._parts())
         except ValueError as error:
             self._error(400, str(error))
+            return
+        except side.InferenceRefused as error:
+            self._error(503, str(error))
+            return
         except Exception as error:
             traceback.print_exc()
-            self._error(500, str(error) or "请求失败")
+            self._error(500, str(error) or "请求失败", type(error).__name__)
+            return
+        self._finish()
 
     def do_POST(self):
+        self._begin()
         try:
             parts = self._parts()
             if parts == ["reproductions"] and self._is_zip():
                 archive = self._read_limited(1_048_576)
+                self._bytes_read = len(archive)
+                self._request = self._open_record()
+                write_request(self._access(), self._request)
                 with LOCK:
                     self._send(200, reproductions.import_package(self.store.root, archive))
-                return
-            with LOCK:
-                self._post(parts, self._read_body())
+            else:
+                with LOCK:
+                    self._post(parts, self._read_body())
         except ValueError as error:
             self._error(400, str(error))
+            return
         except side.InferenceRefused as error:
             self._error(503, str(error))
+            return
         except Exception as error:
             traceback.print_exc()
-            self._error(500, str(error) or "请求失败")
+            self._error(500, str(error) or "请求失败", type(error).__name__)
+            return
+        self._finish()
 
     def _get(self, parts):
         if parts == ["reproductions"]:
@@ -632,6 +713,8 @@ class App(BaseHTTPRequestHandler):
                 return
             record["status"] = "RUNNING"
             self.store.save_experiment(record)
+            self._request = self._open_record().with_experiment(parts[1])
+            write_request(self._access(), self._request)
             try:
                 finished = run_experiment(self.store, record)
             except Exception as error:
