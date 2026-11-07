@@ -32,6 +32,7 @@ EXPOSURES = {"social", "direct"}
 STAGES = {"pilot", "heldout"}
 SOURCE_KINDS = {"fixture", "human"}
 LOCK = threading.Lock()
+_TRAIN_THREADS: dict[str, threading.Thread] = {}
 
 
 class Store:
@@ -592,6 +593,13 @@ class App(BaseHTTPRequestHandler):
         if parts == ["reproductions"]:
             self._send(200, reproductions.list_packages(self.store.root))
             return
+        if len(parts) == 3 and parts[0] == "reproductions" and parts[2] == "train":
+            status = reproductions.train_status(self.store.root, parts[1])
+            if status is None:
+                self._error(404, "没有这个复现包")
+                return
+            self._send(200, status)
+            return
         if len(parts) == 2 and parts[0] == "reproductions":
             detail = reproductions.package_detail(self.store.root, parts[1])
             if detail is None:
@@ -659,11 +667,11 @@ class App(BaseHTTPRequestHandler):
 
     def _post(self, parts, body):
         if len(parts) == 3 and parts[0] == "reproductions" and parts[2] == "launch":
-            result = reproductions.launch_maps(self.store.root, parts[1])
-            if result is None:
+            status = self._start_training(parts[1])
+            if status is None:
                 self._error(404, "没有这个复现包")
                 return
-            self._send(200, result)
+            self._send(200, status)
             return
         if len(parts) == 3 and parts[0] == "reproductions" and parts[2] == "verify":
             result = reproductions.verify_maps(self.store.root, parts[1])
@@ -749,6 +757,32 @@ class App(BaseHTTPRequestHandler):
             self._send(200, {"result": {"status": "stored", "external_validity": side.VALIDITY[protocol["source_kind"]]}})
             return
         self._error(404, "没有这个接口")
+
+    def _start_training(self, research_id: str):
+        if reproductions.train_status(self.store.root, research_id) is None:
+            return None
+        running = _TRAIN_THREADS.get(research_id)
+        if running is not None and running.is_alive():
+            return reproductions.train_status(self.store.root, research_id)
+        status = reproductions.begin_training(self.store.root, research_id)
+        if status is None:
+            return None
+
+        def work():
+            try:
+                reproductions.launch_maps(self.store.root, research_id)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                with LOCK:
+                    current = _TRAIN_THREADS.get(research_id)
+                    if current is threading.current_thread():
+                        _TRAIN_THREADS.pop(research_id, None)
+
+        thread = threading.Thread(target=work, name=f"train-{research_id}", daemon=True)
+        _TRAIN_THREADS[research_id] = thread
+        thread.start()
+        return status
 
     def _freeze(self, body):
         if not isinstance(body, dict):

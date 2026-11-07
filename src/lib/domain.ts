@@ -641,13 +641,116 @@ export function readReproductionList(value: unknown): ReproductionCard[] | null 
   return rows;
 }
 
+export type ConsumerRow = {
+  condition: "A0" | "A1";
+  seed: number;
+  agentId: number;
+  name: string;
+  group: string;
+  age: number;
+  budget: number;
+  postIntention: number;
+  highIntent: boolean;
+  behavior: number | null;
+  probability: number | null;
+  credibility: number | null;
+};
+
+export const TRAIN_PHASES = ["idle", "fitting", "compiling", "scoring", "sampling", "done", "failed"] as const;
+
+export type TrainPhase = (typeof TRAIN_PHASES)[number];
+
+export type TrainStatus = {
+  phase: TrainPhase;
+  step: number;
+  total: 6;
+  message: string;
+  error: string | null;
+};
+
+export function readTrainStatus(value: unknown): TrainStatus | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.phase !== "string" || !isTrainPhase(value.phase)) return null;
+  if (typeof value.step !== "number" || !Number.isInteger(value.step) || value.step < 0 || value.step > 6) return null;
+  if (value.total !== 6) return null;
+  if (typeof value.message !== "string" || value.message === "") return null;
+  if (!("error" in value) || (value.error !== null && typeof value.error !== "string")) return null;
+  if (value.phase === "done" && value.step !== 6) return null;
+  if (value.phase === "idle" && value.step !== 0) return null;
+  if (value.phase !== "idle" && value.phase !== "failed" && value.phase !== "done" && value.step === 0) return null;
+  return {
+    phase: value.phase,
+    step: value.step,
+    total: 6,
+    message: value.message,
+    error: typeof value.error === "string" ? value.error : null,
+  };
+}
+
+export function readConsumers(value: unknown): ConsumerRow[] | null {
+  if (!Array.isArray(value)) return null;
+  const rows: ConsumerRow[] = [];
+  for (const item of value) {
+    const row = readConsumer(item);
+    if (!row) return null;
+    rows.push(row);
+  }
+  return rows;
+}
+
 export function readReproductionDetail(
   value: unknown,
-): { card: ReproductionCard; metrics: unknown; population: unknown; events: unknown } | null {
+): { card: ReproductionCard; metrics: unknown; population: unknown; events: unknown; consumers: ConsumerRow[] } | null {
   if (!isRecord(value)) return null;
   const card = readReproductionCard(value.card);
-  if (!card || !isRecord(value.population) || !isRecord(value.events)) return null;
-  return { card, metrics: value.metrics, population: value.population, events: value.events };
+  const consumers = readConsumers(value.consumers);
+  if (!card || !consumers || !isRecord(value.population) || !isRecord(value.events)) return null;
+  return { card, metrics: value.metrics, population: value.population, events: value.events, consumers };
+}
+
+function isTrainPhase(value: string): value is TrainPhase {
+  return (TRAIN_PHASES as readonly string[]).includes(value);
+}
+
+function readConsumer(value: unknown): ConsumerRow | null {
+  if (!isRecord(value)) return null;
+  if (value.condition !== "A0" && value.condition !== "A1") return null;
+  if (typeof value.seed !== "number" || !Number.isInteger(value.seed)) return null;
+  if (typeof value.agent_id !== "number" || !Number.isInteger(value.agent_id)) return null;
+  if (typeof value.name !== "string" || value.name === "") return null;
+  if (typeof value.group !== "string" || value.group === "") return null;
+  if (typeof value.age !== "number" || !Number.isInteger(value.age)) return null;
+  if (typeof value.budget !== "number" || !Number.isInteger(value.budget)) return null;
+  if (typeof value.post_intention !== "number" || !Number.isInteger(value.post_intention)) return null;
+  if (value.post_intention < 1 || value.post_intention > 5) return null;
+  if (typeof value.high_intent !== "boolean") return null;
+  if (value.high_intent !== (value.post_intention >= 4)) return null;
+  const behavior = readScore(value.behavior);
+  const probability = readScore(value.probability);
+  const credibility = readScore(value.credibility);
+  if (behavior === undefined || probability === undefined || credibility === undefined) return null;
+  const filled = [behavior, probability, credibility].filter((item) => item !== null).length;
+  if (filled !== 0 && filled !== 3) return null;
+  return {
+    condition: value.condition,
+    seed: value.seed,
+    agentId: value.agent_id,
+    name: value.name,
+    group: value.group,
+    age: value.age,
+    budget: value.budget,
+    postIntention: value.post_intention,
+    highIntent: value.high_intent,
+    behavior,
+    probability,
+    credibility,
+  };
+}
+
+function readScore(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return undefined;
 }
 
 function readReproductionChoice(value: unknown): ReproductionCard["choice"] | null {

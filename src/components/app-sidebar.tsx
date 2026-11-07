@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Archive, FlaskConical, Upload } from "lucide-react";
+import { FlaskConical, LayoutDashboard, Upload } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import {
@@ -37,7 +37,7 @@ export function AppSidebar() {
   const items: NavItem[] = [
     { label: "实验表单", href: "/experiments", icon: FlaskConical, needsExperiment: false },
     ...experimentItems,
-    { label: "复现包", href: "/reproductions", icon: Archive, needsExperiment: false },
+    { label: "端侧仪表盘", href: "/reproductions", icon: LayoutDashboard, needsExperiment: false },
     { label: "导入", href: "/import", icon: Upload, needsExperiment: false },
   ];
   const lockedLabels = EXPERIMENT_NAV.map((item) => item.label).join("、");

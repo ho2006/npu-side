@@ -2,18 +2,28 @@
 
 import io
 import json
+import math
 import os
 import re
 import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NewType, TypedDict
+from typing import Callable, Literal, NewType, TypedDict
 
 from npu_occupancy import sustain_npu
 from npu_side.io import write_json
 from npu_side.policy import fingerprint, policy_for
-from npu_side.side_infer import SideCheck, _agent_rows, compile_survey_maps, verify_survey_maps
+from npu_side.side_infer import (
+    SideCheck,
+    _agent_rows,
+    _consumer_scores,
+    _emit_survey_board,
+    _maps,
+    compile_deployed,
+    convert_ir,
+    verify_survey_maps,
+)
 
 ResearchId = NewType("ResearchId", str)
 
@@ -33,6 +43,21 @@ _SAFE_INT = 2**53 - 1
 _CONFLICT = "同一 research_id 的内容不一致，已保留原来的问卷"
 _DIRECT = "这份社交复现包不能当作直接阅读基线"
 _NOT_COMPILED = "尚未在 NPU 上编译"
+_TRAINING = "这个复现包正在训练，已保留原来的问卷"
+_TRAIN_TOTAL: Literal[6] = 6
+_ACTIVE = {"fitting", "compiling", "scoring", "sampling"}
+_PHASES = {"idle", "fitting", "compiling", "scoring", "sampling", "done", "failed"}
+_FIT_STEPS = (
+    (1, "ols", "正在拟合 OLS。"),
+    (2, "ridge", "正在拟合 Ridge。"),
+    (3, "mlp", "正在拟合 MLP。"),
+)
+_COMPILE_MESSAGE = "正在 NPU 上编译。"
+_SCORE_MESSAGE = "正在计算每位消费者的分数。"
+_SAMPLE_MESSAGE = "正在采样 NPU 占用。"
+_DONE_MESSAGE = "训练完成。"
+_IDLE_MESSAGE = "尚未训练"
+_FAIL_MESSAGE = "训练没有完成。"
 
 
 class PackageChoice(TypedDict):
@@ -65,11 +90,35 @@ class PackageCard(TypedDict):
     matches_fit: bool | None
 
 
+class ConsumerRow(TypedDict):
+    condition: str
+    seed: int
+    agent_id: int
+    name: str
+    group: str
+    age: int
+    budget: int
+    post_intention: int
+    high_intent: bool
+    behavior: float | None
+    probability: float | None
+    credibility: float | None
+
+
+class TrainStatus(TypedDict):
+    phase: Literal["idle", "fitting", "compiling", "scoring", "sampling", "done", "failed"]
+    step: int
+    total: Literal[6]
+    message: str
+    error: str | None
+
+
 class PackageDetail(TypedDict):
     card: PackageCard
     metrics: dict
     population: dict
     events: dict
+    consumers: list[ConsumerRow]
 
 
 @dataclass(frozen=True)
@@ -101,6 +150,8 @@ def import_package(root: Path, archive: bytes) -> PackageCard:
     incoming = base / f".incoming-{parsed.research_id}"
     _remove(incoming)
     if final.exists():
+        if _training(final):
+            raise ValueError(_TRAINING)
         package_path = final / "package.json"
         if package_path.is_file():
             stored = _load_json(package_path)
@@ -134,7 +185,7 @@ def list_packages(root: Path) -> list[PackageCard]:
 
 
 def package_detail(root: Path, research_id: str) -> PackageDetail | None:
-    """Return the card plus the stored metrics, population, and events."""
+    """Return the card, stored metrics, population, events, and consumers joined at read time."""
     final = _published(root, research_id)
     if final is None:
         return None
@@ -143,29 +194,86 @@ def package_detail(root: Path, research_id: str) -> PackageDetail | None:
         "metrics": _load_json(final / "metrics.json"),
         "population": _load_json(final / "population.json"),
         "events": _load_json(final / "events.json"),
+        "consumers": _consumers(final),
     }
 
 
-def launch_maps(root: Path, research_id: str) -> PackageCard | None:
-    """Fit and compile the survey rows on the NPU, then sample this process.
+def train_status(root: Path, research_id: str) -> TrainStatus | None:
+    """Status the console polls. A missing file is idle, not an error."""
+    final = _published(root, research_id)
+    if final is None:
+        return None
+    path = final / "side" / "train.json"
+    if not path.is_file():
+        return _train_record("idle", 0, _IDLE_MESSAGE, None)
+    return _read_train(path)
 
-    Reads surveys.json and does not write it. Replaces side/ and occupancy.json
-    only after compile_survey_maps and sustain_npu both return.
+
+def begin_training(root: Path, research_id: str) -> TrainStatus | None:
+    """Record fitting step 1 before the background thread runs."""
+    final = _published(root, research_id)
+    if final is None:
+        return None
+    _write_train(final, _train_record("fitting", 1, _FIT_STEPS[0][2], None))
+    return _read_train(final / "side" / "train.json")
+
+
+def launch_maps(root: Path, research_id: str, *, compile_model: Callable | None = None) -> PackageCard | None:
+    """Fit, compile, score, and sample. Publish side/ only after both NPU steps return.
+
+    Reads surveys.json and does not write it. train.json in the package is the
+    status the console polls. Models and consumer_scores.json stay in a temp
+    directory until compile and sustain_npu both return.
     """
     final = _published(root, research_id)
     if final is None:
         return None
-    surveys = _load_json(final / "surveys.json")
-    if not isinstance(surveys, list):
-        raise ValueError("问卷无法读取")
-    policy = policy_for(_load_json(final / "policy_config.json"))
+    compile_one = compile_deployed if compile_model is None else compile_model
     dest = final.parent / f".launch-{research_id}"
+    cursor = {"step": _FIT_STEPS[0][0], "phase": "fitting", "message": _FIT_STEPS[0][2]}
     _remove(dest)
     try:
-        compile_survey_maps(surveys, policy, dest)
+        surveys = _load_json(final / "surveys.json")
+        if not isinstance(surveys, list):
+            raise ValueError("问卷无法读取")
+        policy = policy_for(_load_json(final / "policy_config.json"))
+        rows = _agent_rows(surveys, policy)
+        if len(rows) < 2:
+            raise ValueError("问卷不足以配成两对前后测")
+        by_id = {spec.id: spec for spec in _maps()}
+        fitted = []
+        for step, algorithm_id, message in _FIT_STEPS:
+            spec = by_id[algorithm_id]
+            cursor.update(step=step, phase="fitting", message=message)
+            _write_train(final, _train_record("fitting", step, message, None))
+            fitted.append((spec, spec.fit(rows), spec.fit_probability(rows)))
+        cursor.update(step=4, phase="compiling", message=_COMPILE_MESSAGE)
+        _write_train(final, _train_record("compiling", 4, _COMPILE_MESSAGE, None))
+        prepared = []
+        compiled_maps = []
+        compiled_probs = {}
+        irs = []
+        for spec, model, probability in fitted:
+            map_ir = convert_ir(model)
+            probability_ir = convert_ir(probability)
+            compiled_maps.append((spec.id, compile_one(map_ir)))
+            compiled_probs[spec.id] = compile_one(probability_ir)
+            irs.append((spec.id, map_ir))
+            prepared.append((spec, map_ir))
+        _emit_survey_board(prepared, compiled_maps, irs, rows, dest)
+        cursor.update(step=5, phase="scoring", message=_SCORE_MESSAGE)
+        _write_train(final, _train_record("scoring", 5, _SCORE_MESSAGE, None))
+        write_json(dest / "consumer_scores.json", _consumer_scores(rows, compiled_maps, compiled_probs))
+        cursor.update(step=6, phase="sampling", message=_SAMPLE_MESSAGE)
+        _write_train(final, _train_record("sampling", 6, _SAMPLE_MESSAGE, None))
         sample = sustain_npu(seconds=4)
-    except Exception:
+        write_json(dest / "train.json", _train_record("done", 6, _DONE_MESSAGE, None))
+    except Exception as error:
         _remove(dest)
+        _write_train(
+            final,
+            _train_record("failed", cursor["step"], _FAIL_MESSAGE, str(error) or _FAIL_MESSAGE),
+        )
         raise
     _replace_tree(final / "side", dest)
     write_json(final / "occupancy.json", sample)
@@ -409,6 +517,161 @@ def _published(root: Path, research_id: str) -> Path | None:
     return final
 
 
+def _train_record(
+    phase: Literal["idle", "fitting", "compiling", "scoring", "sampling", "done", "failed"],
+    step: int,
+    message: str,
+    error: str | None,
+) -> TrainStatus:
+    return {"phase": phase, "step": step, "total": _TRAIN_TOTAL, "message": message, "error": error}
+
+
+def _write_train(package_dir: Path, status: TrainStatus) -> None:
+    side = package_dir / "side"
+    side.mkdir(parents=True, exist_ok=True)
+    write_json(side / "train.json", status)
+
+
+def _read_train(path: Path) -> TrainStatus:
+    value = _load_json(path)
+    if not isinstance(value, dict):
+        raise ValueError("训练状态无法读取")
+    phase = value.get("phase")
+    step = value.get("step")
+    message = value.get("message")
+    error = value.get("error")
+    if phase not in _PHASES or type(step) is not int or not 0 <= step <= _TRAIN_TOTAL:
+        raise ValueError("训练状态无法读取")
+    if value.get("total") != _TRAIN_TOTAL or not isinstance(message, str) or message == "":
+        raise ValueError("训练状态无法读取")
+    if error is not None and not isinstance(error, str):
+        raise ValueError("训练状态无法读取")
+    if phase == "done" and step != _TRAIN_TOTAL:
+        raise ValueError("训练状态无法读取")
+    if phase == "idle" and step != 0:
+        raise ValueError("训练状态无法读取")
+    if phase in _ACTIVE and step == 0:
+        raise ValueError("训练状态无法读取")
+    return {"phase": phase, "step": step, "total": _TRAIN_TOTAL, "message": message, "error": error}
+
+
+def _training(package_dir: Path) -> bool:
+    path = package_dir / "side" / "train.json"
+    if not path.is_file():
+        return False
+    return _read_train(path)["phase"] in _ACTIVE
+
+
+def _consumers(package_dir: Path) -> list[ConsumerRow]:
+    surveys = _load_json(package_dir / "surveys.json")
+    population = _load_json(package_dir / "population.json")
+    if not isinstance(surveys, list) or not isinstance(population, dict):
+        raise ValueError("问卷无法读取")
+    people = population.get("people")
+    if not isinstance(people, list):
+        raise ValueError("人口或关系无法读取")
+    portraits = {}
+    for person in people:
+        if not isinstance(person, dict):
+            raise ValueError("人口或关系无法读取")
+        person_id = _whole_id(person.get("id"))
+        if person_id is None:
+            raise ValueError("人口或关系无法读取")
+        portraits[person_id] = person
+    scores = _score_index(package_dir)
+    paired: dict[tuple[str, int, int], dict] = {}
+    for row in surveys:
+        if not isinstance(row, dict):
+            raise ValueError("问卷无法读取")
+        condition = row.get("condition")
+        phase = row.get("phase")
+        if condition not in ("A0", "A1") or phase not in ("pre", "post"):
+            continue
+        seed = _whole_id(row.get("seed"))
+        agent_id = _whole_id(row.get("agent_id"))
+        if seed is None or agent_id is None:
+            raise ValueError("问卷无法读取")
+        paired.setdefault((condition, seed, agent_id), {})[phase] = row
+    consumers = []
+    for condition, seed, agent_id in sorted(paired):
+        phases = paired[(condition, seed, agent_id)]
+        if "pre" not in phases or "post" not in phases:
+            continue
+        person = portraits.get(agent_id)
+        if not isinstance(person, dict):
+            raise ValueError("人口或关系无法读取")
+        name = person.get("name")
+        group = person.get("group")
+        age = _whole_id(person.get("age"))
+        budget = _whole_id(person.get("budget"))
+        if not isinstance(name, str) or name == "" or not isinstance(group, str) or group == "":
+            raise ValueError("人口或关系无法读取")
+        if age is None or budget is None:
+            raise ValueError("人口或关系无法读取")
+        intention = _post_intention(phases["post"])
+        found = None if scores is None else scores.get((condition, seed, agent_id))
+        consumers.append(
+            {
+                "condition": condition,
+                "seed": seed,
+                "agent_id": agent_id,
+                "name": name,
+                "group": group,
+                "age": age,
+                "budget": budget,
+                "post_intention": intention,
+                "high_intent": intention >= 4,
+                "behavior": None if found is None else found["behavior"],
+                "probability": None if found is None else found["probability"],
+                "credibility": None if found is None else found["credibility"],
+            }
+        )
+    return consumers
+
+
+def _post_intention(row: dict) -> int:
+    answer = row.get("answer")
+    if not isinstance(answer, dict) or type(answer.get("intention")) is not int:
+        raise ValueError("问卷无法读取")
+    intention = answer["intention"]
+    if not 1 <= intention <= 5:
+        raise ValueError("问卷无法读取")
+    return intention
+
+
+def _score_index(package_dir: Path) -> dict[tuple[str, int, int], dict[str, float]] | None:
+    path = package_dir / "side" / "consumer_scores.json"
+    if not path.is_file():
+        return None
+    value = _load_json(path)
+    if not isinstance(value, list):
+        raise ValueError("消费者分数无法读取")
+    index = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("消费者分数无法读取")
+        condition = item.get("condition")
+        seed = _whole_id(item.get("seed"))
+        agent_id = _whole_id(item.get("agent_id"))
+        if condition not in ("A0", "A1") or seed is None or agent_id is None:
+            raise ValueError("消费者分数无法读取")
+        key = (condition, seed, agent_id)
+        if key in index:
+            raise ValueError("消费者分数无法读取")
+        index[key] = {
+            "behavior": _finite(item.get("behavior")),
+            "probability": _finite(item.get("probability")),
+            "credibility": _finite(item.get("credibility")),
+        }
+    return index
+
+
+def _finite(value) -> float:
+    if isinstance(value, bool) or type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError("消费者分数无法读取")
+    return float(value)
+
+
 def _write_new(directory: Path, parsed: _ParsedPackage) -> None:
     write_json(
         directory / "package.json",
@@ -492,6 +755,8 @@ __all__ = (
     "import_package",
     "list_packages",
     "package_detail",
+    "train_status",
+    "begin_training",
     "launch_maps",
     "verify_maps",
 )

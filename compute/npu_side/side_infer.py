@@ -132,6 +132,8 @@ class _MapSpec(Protocol):
 
     def fit(self, rows: list[dict]) -> nn.Module: ...
 
+    def fit_probability(self, rows: list[dict]) -> nn.Module: ...
+
     def note(self) -> dict[str, str | int | float]: ...
 
 
@@ -147,6 +149,34 @@ class _LogitMap(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.activation(self.linear(features))
+
+
+class _ProbabilityLogit(nn.Module):
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor) -> None:
+        super().__init__()
+        # A second module so _LogitMap stays 7 inputs and 6 outputs.
+        self.linear = nn.Linear(7, 1)
+        with torch.no_grad():
+            self.linear.weight.copy_(weight)
+            self.linear.bias.copy_(bias)
+        self.activation = nn.Sigmoid()
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.linear(features))
+
+
+class _ProbabilityNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(7, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.layers(features)
 
 
 def _plain_answer(answer):
@@ -195,12 +225,13 @@ def _agent_rows(surveys, policy):
             continue
         paired.setdefault((condition, row["seed"], row["agent_id"]), {})[phase] = row["answer"]
     rows = []
-    for (condition, seed, _agent_id), answers in paired.items():
+    for (condition, seed, agent_id), answers in paired.items():
         if "pre" not in answers or "post" not in answers:
             continue
         rows.append({
             "condition": condition,
             "seed": seed,
+            "agent_id": agent_id,
             "x": encode_input(condition, answers["pre"], policy),
             "y": encode_target(answers["post"], policy),
         })
@@ -226,28 +257,72 @@ def fit_map(rows, seed=SEED, epochs=EPOCHS):
     return model
 
 
-def _fit_logit(rows: list[dict], penalty: float) -> nn.Module:
-    features = torch.tensor([row["x"] for row in rows], dtype=torch.float32)
-    targets = torch.tensor([row["y"] for row in rows], dtype=torch.float32)
+def _logit_weight(features: torch.Tensor, targets: torch.Tensor, penalty: float) -> tuple[torch.Tensor, torch.Tensor]:
     clipped = targets.clamp(_LOGIT_CLIP, 1.0 - _LOGIT_CLIP)
     z = torch.log(clipped / (1.0 - clipped))
+    width = int(features.shape[1])
     if penalty == 0:
         # Wide [X | 1]. lstsq is the minimum-norm fit, intercept included.
         design = torch.cat([features, torch.ones(features.shape[0], 1)], dim=1)
         solution = torch.linalg.lstsq(design, z).solution
-        weight = solution[:7].T
-        bias = solution[7]
+        weight = solution[:width].T
+        bias = solution[width]
     else:
         # Penalty hits the seven slopes. The intercept stays at the unpenalized center.
         x_mean = features.mean(dim=0)
         z_mean = z.mean(dim=0)
         centered_x = features - x_mean
         centered_z = z - z_mean
-        gram = centered_x.T @ centered_x + penalty * torch.eye(7, dtype=features.dtype)
+        gram = centered_x.T @ centered_x + penalty * torch.eye(width, dtype=features.dtype)
         slopes = torch.linalg.solve(gram, centered_x.T @ centered_z)
         weight = slopes.T
         bias = z_mean - x_mean @ slopes
-    model = _LogitMap(weight.contiguous(), bias.contiguous())
+    return weight.contiguous(), bias.contiguous()
+
+
+def _fit_logit(rows: list[dict], penalty: float) -> nn.Module:
+    features = torch.tensor([row["x"] for row in rows], dtype=torch.float32)
+    targets = torch.tensor([row["y"] for row in rows], dtype=torch.float32)
+    weight, bias = _logit_weight(features, targets, penalty)
+    model = _LogitMap(weight, bias)
+    model.eval()
+    return model
+
+
+def _high_intent(row: dict) -> bool:
+    # Post intention 4 is the scaled target 0.75. The probability label is that cut.
+    return float(row["y"][5]) >= 0.75
+
+
+def _binary_rows(rows: list[dict]) -> list[dict]:
+    return [{"x": row["x"], "y": [1.0 if _high_intent(row) else 0.0]} for row in rows]
+
+
+def _fit_probability_logit(rows: list[dict], penalty: float) -> nn.Module:
+    binary = _binary_rows(rows)
+    features = torch.tensor([row["x"] for row in binary], dtype=torch.float32)
+    targets = torch.tensor([row["y"] for row in binary], dtype=torch.float32)
+    weight, bias = _logit_weight(features, targets, penalty)
+    model = _ProbabilityLogit(weight, bias)
+    model.eval()
+    return model
+
+
+def _fit_probability_mlp(rows: list[dict], seed: int = SEED, epochs: int = EPOCHS) -> nn.Module:
+    binary = _binary_rows(rows)
+    torch.manual_seed(seed)
+    model = _ProbabilityNet().to("cpu")
+    features = torch.tensor([row["x"] for row in binary], dtype=torch.float32, device="cpu")
+    targets = torch.tensor([row["y"] for row in binary], dtype=torch.float32, device="cpu")
+    optimizer = torch.optim.Adam(model.parameters())
+    loss_fn = nn.BCELoss()
+    model.train()
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        predicted = model(features)
+        loss = loss_fn(predicted, targets)
+        loss.backward()
+        optimizer.step()
     model.eval()
     return model
 
@@ -260,6 +335,9 @@ class _LogitSpec:
     def fit(self, rows: list[dict]) -> nn.Module:
         return _fit_logit(rows, self.penalty)
 
+    def fit_probability(self, rows: list[dict]) -> nn.Module:
+        return _fit_probability_logit(rows, self.penalty)
+
     def note(self) -> dict[str, str | int | float]:
         return {"form": "closed_logit", "penalty": self.penalty, "clip": _LOGIT_CLIP}
 
@@ -269,6 +347,9 @@ class _MlpSpec:
 
     def fit(self, rows: list[dict]) -> nn.Module:
         return fit_map(rows)
+
+    def fit_probability(self, rows: list[dict]) -> nn.Module:
+        return _fit_probability_mlp(rows)
 
     def note(self) -> dict[str, str | int | float]:
         return {"form": "mlp", "seed": SEED, "epochs": EPOCHS}
@@ -634,6 +715,46 @@ def run_verify(store, protocol, experiment_id: str) -> SideCheck:
     return check
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
+
+
+def _consumer_scores(rows: list[dict], compiled_maps: list[tuple[str, object]], compiled_probs: dict[str, object]) -> list[dict]:
+    maps = {algorithm_id: compiled for algorithm_id, compiled in compiled_maps}
+    mlp = maps["mlp"]
+    scores = []
+    ordered = sorted(rows, key=lambda row: (row["condition"], row["seed"], row["agent_id"]))
+    for row in ordered:
+        predicted = infer_row(mlp, row["x"])
+        behavior = _clamp(1.0 + 4.0 * float(predicted[5]), 1.0, 5.0)
+        probabilities = [float(infer_row(compiled_probs[name], row["x"])[0]) for name in ("ols", "ridge", "mlp")]
+        spread = max(probabilities) - min(probabilities)
+        scores.append({
+            "condition": row["condition"],
+            "seed": row["seed"],
+            "agent_id": row["agent_id"],
+            "behavior": behavior,
+            "probability": sum(probabilities) / len(probabilities),
+            "credibility": _clamp(1.0 - spread, 0.0, 1.0),
+        })
+    return scores
+
+
+def _emit_survey_board(prepared, compiled_in_order, irs, rows, dest: Path) -> SurveyMapBoard:
+    ids = tuple(spec.id for spec, _ir in prepared)
+    reports = {algorithm_id: _discrepancy(compiled, rows) for algorithm_id, compiled in compiled_in_order}
+    board = {
+        "status": "COMPILED",
+        "device": "NPU",
+        "runtime": "openvino",
+        "algorithms": [{"id": spec.id, "fit": spec.note()} for spec, _ir in prepared],
+        "agents": _agent_columns(ids, reports),
+        "n_rows": len(rows),
+    }
+    _publish(dest, ids, irs, board)
+    return board
+
+
 def compile_survey_maps(surveys: list, policy: dict, dest: Path) -> SurveyMapBoard:
     """Fit every map from _maps on these survey rows and compile each IR on the NPU.
 
@@ -651,18 +772,7 @@ def compile_survey_maps(surveys: list, policy: dict, dest: Path) -> SurveyMapBoa
     for spec, ir in prepared:
         compiled_in_order.append((spec.id, compile_deployed(ir)))
         irs.append((spec.id, ir))
-    ids = tuple(spec.id for spec, _ir in prepared)
-    reports = {algorithm_id: _discrepancy(compiled, rows) for algorithm_id, compiled in compiled_in_order}
-    board = {
-        "status": "COMPILED",
-        "device": "NPU",
-        "runtime": "openvino",
-        "algorithms": [{"id": spec.id, "fit": spec.note()} for spec, _ir in prepared],
-        "agents": _agent_columns(ids, reports),
-        "n_rows": len(rows),
-    }
-    _publish(dest, ids, irs, board)
-    return board
+    return _emit_survey_board(prepared, compiled_in_order, irs, rows, dest)
 
 
 def verify_survey_maps(surveys: list, policy: dict, side_dir: Path) -> SideCheck:
